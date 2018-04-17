@@ -37,6 +37,41 @@ func (c *Corpus) propSingleSeed(vi int, T int) result {
 	}
 }
 
+func (c *Corpus) calcPolarity(results <-chan result, gamma float64) map[string]float64 {
+	pos := make(map[int]float64)
+	neg := make(map[int]float64)
+
+	totalP := 0.0
+	totalN := 0.0
+	for res := range results {
+		pol := pos
+		sign := true
+		if _, ok := c.N[res.vi]; ok {
+			pol = neg
+			sign = false
+		}
+		for vj, aij := range res.alpha {
+			pol[vj] += aij
+			if sign {
+				totalP += aij
+			} else {
+				totalN += aij
+			}
+		}
+	}
+	beta := totalP / totalN
+
+	pol := make(map[string]float64)
+	for item, id := range c.IDMap {
+		itemPol := pos[id] - beta*neg[id]
+		if math.Abs(itemPol) < gamma {
+			continue
+		}
+		pol[item] = itemPol
+	}
+	return pol
+}
+
 func (c *Corpus) GenLexicon(T int, gamma float64, nWorkers int) map[string]float64 {
 	seeds := make(chan int, nWorkers)
 	results := make(chan result, nWorkers)
@@ -69,39 +104,5 @@ func (c *Corpus) GenLexicon(T int, gamma float64, nWorkers int) map[string]float
 		close(seeds)
 	}()
 
-	// Aggregate results across N and P
-	polPos := make(map[int]float64)
-	polNeg := make(map[int]float64)
-	for res := range results {
-		polarity := polPos
-		if _, ok := c.N[res.vi]; ok {
-			polarity = polNeg
-		}
-		for vj, aij := range res.alpha {
-			polarity[vj] += aij
-		}
-	}
-
-	// Calculate normalization factor beta
-	totalP := 0.0
-	totalN := 0.0
-
-	for _, a := range polPos {
-		totalP += a
-	}
-	for _, a := range polNeg {
-		totalN += a
-	}
-	beta := totalP / totalN
-
-	// Calculate the final polarity and threshold using gamma
-	pol := make(map[string]float64)
-	for item, id := range c.IDMap {
-		ipol := polPos[id] - beta*polNeg[id]
-		if math.Abs(ipol) < gamma {
-			continue
-		}
-		pol[item] = ipol
-	}
-	return pol
+	return c.calcPolarity(results, gamma)
 }

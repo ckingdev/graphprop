@@ -3,13 +3,13 @@ package graphprop
 import (
 	"bufio"
 	"bytes"
-	"fmt"
 	"io/ioutil"
 	"math"
 	"os"
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 type Corpus struct {
@@ -102,94 +102,103 @@ func LoadCorpus(dir string) (*Corpus, error) {
 	}, nil
 }
 
-func (c *Corpus) Propagate(T int, gamma float64) {
-	// Propagate positive sentiment
+type result struct {
+	vi    int
+	alpha map[int]float64
+}
 
-	// This should be a copy of c.W initially.
-	alpha := make(map[[2]int]float64)
-	for vi, neighbors := range c.W {
-		for vj, wij := range neighbors {
-			alpha[[2]int{vi, vj}] = wij
-		}
+func (c *Corpus) propSingleSeed(vi int, T int) result {
+	alpha := make(map[int]float64)
+	for vj, w := range c.W[vi] {
+		alpha[vj] = w
 	}
-
-	for vi := range c.P {
-		F := map[int]struct{}{vi: {}}
-		for t := 0; t < T; t++ {
-			for vk := range F {
-				for vj, wkj := range c.W[vk] {
-					aij := alpha[[2]int{vi, vj}]
-					aikj := alpha[[2]int{vi, vk}] * wkj
-					if aikj > aij {
-						alpha[[2]int{vi, vj}] = aikj
-					}
-					F[vj] = struct{}{}
+	F := map[int]struct{}{vi: {}}
+	for t := 0; t < T; t++ {
+		updateF := make(map[int]struct{})
+		for vk := range F {
+			for vj, wkj := range c.W[vk] {
+				aikj := alpha[vk] * wkj
+				if alpha[vj] < aikj {
+					alpha[vj] = aikj
 				}
+				updateF[vj] = struct{}{}
 			}
 		}
-	}
-	polP := make([]float64, len(c.IDMap))
-
-	for _, vj := range c.IDMap {
-		for vi := range c.P {
-			polP[vj] += alpha[[2]int{vi, vj}]
+		for v := range updateF {
+			F[v] = struct{}{}
 		}
 	}
-	fmt.Printf("%v\n", polP)
-
-	// Repeat the process with N
-
-	// This should be a copy of c.W initially.
-	alpha = make(map[[2]int]float64)
-	for vi, neighbors := range c.W {
-		for vj, wij := range neighbors {
-			alpha[[2]int{vi, vj}] = wij
-		}
+	return result{
+		vi:    vi,
+		alpha: alpha,
 	}
+}
 
-	for vi := range c.N {
-		F := map[int]struct{}{vi: {}}
-		for t := 0; t < T; t++ {
-			for vk := range F {
-				for vj, wkj := range c.W[vk] {
-					aij := alpha[[2]int{vi, vj}]
-					aikj := alpha[[2]int{vi, vk}] * wkj
-					if aikj > aij {
-						alpha[[2]int{vi, vj}] = aikj
-					}
-					F[vj] = struct{}{}
-				}
+func (c *Corpus) GenLexicon(T int, gamma float64, nWorkers int) map[string]float64 {
+	seeds := make(chan int, nWorkers)
+	results := make(chan result, nWorkers)
+
+	// Spin up nWorkers goroutines to propagate sentiment from single nodes
+	var wg sync.WaitGroup
+	for i := 0; i < nWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for vi := range seeds {
+				res := c.propSingleSeed(vi, T)
+				results <- res
 			}
+		}()
+	}
+	// Close results channel when all the workers are done.
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+	// Push all the seed nodes into the queue, we'll sort out polarity later
+	go func() {
+		for pi := range c.P {
+			seeds <- pi
+		}
+		for ni := range c.N {
+			seeds <- ni
+		}
+		close(seeds)
+	}()
+
+	// Aggregate results across N and P
+	polPos := make(map[int]float64)
+	polNeg := make(map[int]float64)
+	for res := range results {
+		polarity := polPos
+		if _, ok := c.N[res.vi]; ok {
+			polarity = polNeg
+		}
+		for vj, aij := range res.alpha {
+			polarity[vj] += aij
 		}
 	}
-	polN := make([]float64, len(c.IDMap))
 
-	for _, vj := range c.IDMap {
-		for vi := range c.N {
-			polN[vj] += alpha[[2]int{vi, vj}]
-		}
-	}
-
-	fmt.Printf("%v\n", polN)
-
-	// Calculate the normalization factor beta
+	// Calculate normalization factor beta
 	totalP := 0.0
-	for _, p := range polP {
-		totalP += p
-	}
 	totalN := 0.0
-	for _, p := range polN {
-		totalN += p
+
+	for _, a := range polPos {
+		totalP += a
+	}
+	for _, a := range polNeg {
+		totalN += a
 	}
 	beta := totalP / totalN
 
-	// Generate the polarity scores and drop any below gamma
-	pol := make([]float64, len(c.IDMap))
-	for i := 0; i < len(c.IDMap); i++ {
-		pol[i] = polP[i] - beta*polN[i]
-		if math.Abs(pol[i]) < gamma {
-			pol[i] = 0
+	// Calculate the final polarity and threshold using gamma
+	pol := make(map[string]float64)
+	for item, id := range c.IDMap {
+		ipol := polPos[id] - beta*polNeg[id]
+		if math.Abs(ipol) < gamma {
+			continue
 		}
+		pol[item] = ipol
 	}
-	fmt.Printf("pol: %v\n", pol)
+	return pol
 }
